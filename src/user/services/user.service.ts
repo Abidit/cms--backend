@@ -168,6 +168,9 @@ export class UserService {
   ): Promise<{ users: UserOutput[]; count: number }> {
     this.logger.log(ctx, `${this.getUsers.name} was called`);
 
+    const canReadVerificationMessages =
+      ctx.user?.userType === UserType.ADMIN ||
+      ctx.user?.userType === UserType.SUPER_ADMIN;
     const [users, count] = await Promise.all([
       this.prismaService.user.findMany({
         take: limit,
@@ -176,7 +179,14 @@ export class UserService {
           createdAt: "desc",
         },
         include: {
-          organization: { include: { address: true } },
+          organization: {
+            include: {
+              address: true,
+              ...(canReadVerificationMessages
+                ? { verificationMessages: { orderBy: { createdAt: "asc" } } }
+                : {}),
+            },
+          },
         },
       }),
       this.prismaService.user.count(),
@@ -189,7 +199,7 @@ export class UserService {
             ? null
             : u.organization
           : undefined;
-        return this.toUserOutput(u, preloaded);
+        return this.toUserOutput(u, preloaded, canReadVerificationMessages);
       }),
     );
 
@@ -207,7 +217,11 @@ export class UserService {
 
     if (!user) throw new UnauthorizedException("User not found.");
 
-    return this.toUserOutput(user);
+    const canReadVerificationMessages =
+      ctx.user?.id === id ||
+      ctx.user?.userType === UserType.ADMIN ||
+      ctx.user?.userType === UserType.SUPER_ADMIN;
+    return this.toUserOutput(user, undefined, canReadVerificationMessages);
   }
 
   private async resolveOrganizationForUser(user: {
@@ -215,13 +229,18 @@ export class UserService {
     email: string;
     userType: UserType;
     organizationId: string | null;
-  }) {
+  }, includeVerificationMessages = false) {
     if (!user.organizationId) {
       return null;
     }
     return this.prismaService.organizations.findFirst({
       where: { id: user.organizationId, deletedAt: null },
-      include: { address: true },
+      include: {
+        address: true,
+        ...(includeVerificationMessages
+          ? { verificationMessages: { orderBy: { createdAt: "asc" } } }
+          : {}),
+      },
     });
   }
 
@@ -229,13 +248,26 @@ export class UserService {
     user: UserEntity,
     /** When set, skip org lookup (used by list to avoid N+1 queries). */
     preloadedOrg?: (Organizations & { address?: Address | null }) | null,
+    includeVerificationMessages = false,
   ): Promise<UserOutput> {
     const org =
       preloadedOrg !== undefined
         ? preloadedOrg
-        : await this.resolveOrganizationForUser(user);
+        : await this.resolveOrganizationForUser(user, includeVerificationMessages);
     // Plain object (not a class instance) so ClassSerializerInterceptor does not
     // drop `role` / nested `organization` when serializing GET /users/me.
+    const verificationOrg = org as (Organizations & {
+      verificationDocuments?: unknown;
+      verificationAdminMessage?: string | null;
+      verificationMessageSentAt?: Date | null;
+      verificationMessages?: Array<{
+        id: string;
+        senderType: "ORGANIZATION" | "ADMIN";
+        senderUserId: string | null;
+        message: string;
+        createdAt: Date;
+      }>;
+    }) | null;
     const organizationPayload =
       org === null
         ? null
@@ -260,10 +292,28 @@ export class UserService {
           socials: user.socials,
           verificationDocumentUrl: org.verificationDocumentUrl ?? null,
           verificationDocumentId: org.verificationDocumentId ?? null,
+          verificationDocuments: Array.isArray(verificationOrg?.verificationDocuments)
+            ? verificationOrg.verificationDocuments
+            : org.verificationDocumentUrl && org.verificationDocumentId
+              ? [{ id: org.verificationDocumentId, url: org.verificationDocumentUrl }]
+              : [],
           verificationRequestRemarks: org.verificationRequestRemarks ?? null,
           verificationRequestedAt: org.verificationRequestedAt
             ? org.verificationRequestedAt.toISOString()
             : null,
+          verificationAdminMessage: verificationOrg?.verificationAdminMessage ?? null,
+          verificationMessageSentAt: verificationOrg?.verificationMessageSentAt
+            ? verificationOrg.verificationMessageSentAt.toISOString()
+            : null,
+          verificationMessages: (verificationOrg?.verificationMessages ?? []).map(
+            (verificationMessage) => ({
+              id: verificationMessage.id,
+              senderType: verificationMessage.senderType,
+              senderUserId: verificationMessage.senderUserId,
+              message: verificationMessage.message,
+              createdAt: verificationMessage.createdAt.toISOString(),
+            }),
+          ),
         };
 
     return {
@@ -330,6 +380,7 @@ export class UserService {
     const hasVerificationPatch =
       input.verificationDocumentUrl !== undefined ||
       input.verificationDocumentId !== undefined ||
+      input.verificationDocuments !== undefined ||
       input.verificationRequestRemarks !== undefined;
 
     if (
@@ -447,12 +498,46 @@ export class UserService {
         orgData.verificationDocumentId = docId;
         orgData.verificationRequestedAt = new Date();
       }
+      if (input.verificationDocuments !== undefined) {
+        if (input.verificationDocuments.length === 0 || input.verificationDocuments.length > 3) {
+          throw new BadRequestException("Submit between one and three verification documents.");
+        }
+        const documents = input.verificationDocuments.map((document) => ({
+          id: document.id?.trim(),
+          url: document.url?.trim(),
+        }));
+        if (documents.some((document) => !document.id || !document.url)) {
+          throw new BadRequestException("Each verification document needs an id and URL.");
+        }
+        (orgData as Prisma.OrganizationsUpdateInput & { verificationDocuments?: unknown }).verificationDocuments = documents;
+        // Keep legacy fields populated for existing API consumers.
+        orgData.verificationDocumentId = documents[0].id;
+        orgData.verificationDocumentUrl = documents[0].url;
+        orgData.verificationRequestedAt = new Date();
+        (orgData as Prisma.OrganizationsUpdateInput & { verificationAdminMessage?: string | null }).verificationAdminMessage = null;
+        (orgData as Prisma.OrganizationsUpdateInput & { verificationMessageSentAt?: Date | null }).verificationMessageSentAt = null;
+      }
     }
 
     if (Object.keys(orgData).length > 0) {
-      await this.prismaService.organizations.update({
-        where: { id: org.id },
-        data: orgData,
+      await this.prismaService.$transaction(async (tx) => {
+        await tx.organizations.update({
+          where: { id: org.id },
+          data: orgData,
+        });
+        const remarks = input.verificationRequestRemarks?.trim();
+        if (remarks) {
+          await (tx as unknown as {
+            organizationVerificationMessage: { create: (args: unknown) => Promise<unknown> };
+          }).organizationVerificationMessage.create({
+            data: {
+              organizationId: org.id,
+              senderType: "ORGANIZATION",
+              senderUserId: userId,
+              message: remarks,
+            },
+          });
+        }
       });
     }
 
@@ -568,21 +653,6 @@ export class UserService {
       throw new UnauthorizedException();
     }
 
-    const user = await this.prismaService.user.findUnique({
-      where: { id },
-      include: { organization: true },
-    });
-
-    if (!user) {
-      throw new NotFoundException("User not found.");
-    }
-
-    // Preventive safety check: user cannot delete their own active session account
-    if (ctx.user.id === id) {
-      throw new BadRequestException("You cannot delete your own user account.");
-    }
-
-    // Role restriction check: Only SUPER_ADMIN and ADMIN can delete users
     const actorRole = ctx.user.userType;
     if (actorRole !== UserType.SUPER_ADMIN && actorRole !== UserType.ADMIN) {
       throw new ForbiddenException(
@@ -590,36 +660,33 @@ export class UserService {
       );
     }
 
-    // ADMIN role cannot delete a SUPER_ADMIN account
+    if (ctx.user.id === id) {
+      throw new BadRequestException("You cannot delete your own user account.");
+    }
+
+    const user = await this.prismaService.user.findUnique({
+      where: { id },
+    });
+
+    if (!user) {
+      throw new NotFoundException("User not found.");
+    }
+
     if (actorRole === UserType.ADMIN && user.userType === UserType.SUPER_ADMIN) {
       throw new ForbiddenException("Admins cannot delete Super Admin accounts.");
     }
 
     const output = await this.toUserOutput(user);
 
-    // Unlink authored blogs before deleting user to prevent DB foreign key constraint errors
-    await this.prismaService.blog.updateMany({
-      where: { authorId: id },
-      data: { authorId: null },
-    });
-
-    const linkedOrgId = user.organizationId;
-
-    // Delete user from database
-    await this.prismaService.user.delete({
-      where: { id },
-    });
-
-    // If user was an organization account, clean up the linked organization record
-    if (linkedOrgId) {
-      await this.prismaService.organizations
-        .delete({
-          where: { id: linkedOrgId },
-        })
-        .catch(() => {
-          // Silently handle if organization record was already deleted
-        });
-    }
+    // Hard delete frees the globally unique email. The linked organization and
+    // authored content are intentionally kept; blogs are only detached.
+    await this.prismaService.$transaction([
+      this.prismaService.blog.updateMany({
+        where: { authorId: id },
+        data: { authorId: null },
+      }),
+      this.prismaService.user.delete({ where: { id } }),
+    ]);
 
     // Log the activity details (who deleted what)
     const targetName = user.fullName || user.email;
