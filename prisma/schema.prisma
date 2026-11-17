@@ -42,6 +42,7 @@ model User {
   i_am                            String    @default("Student")
   organizationId                String?   @unique
   blogs                           Blog[]
+  media                           Media[]
   address                         Address?  @relation(fields: [addressId], references: [id])
   gallery                         Gallery[] @relation("GalleryToUser")
   tags                            Tags[]    @relation("TagsToUser")
@@ -97,6 +98,25 @@ model Organizations {
   organizationGallery Gallery[] @relation("GalleryToOrganizations")
   tags                Tags[]    @relation("OrganizationsToTags")
   linkedAccountUser   User?   @relation("UserOrganizationLink")
+  verificationMessages OrganizationVerificationMessage[]
+}
+
+enum VerificationMessageSenderType {
+  ORGANIZATION
+  ADMIN
+}
+
+model OrganizationVerificationMessage {
+  id             String                        @id @default(cuid())
+  organizationId String
+  senderType     VerificationMessageSenderType
+  senderUserId   String?
+  message        String                        @db.Text
+  createdAt      DateTime                      @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime                      @updatedAt @db.Timestamptz(6)
+  organization   Organizations                 @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, createdAt])
 }
 
 model Events {
@@ -154,7 +174,7 @@ model Opportunity {
   organizer           String    @map("organizer")
   isDraft             Boolean   @default(true)
   moderationStatus    ContentStatus @default(DRAFT)
-  status              String    @default("open")
+  status              EventStatus @default(OPEN)
   reviewFeedback      String?
   websiteUrl          String?
   socials             Json?
@@ -205,6 +225,37 @@ model Blog {
   authorUser      User?      @relation(fields: [authorId], references: [id])
   categoryData    Category?  @relation(fields: [categoryId], references: [id])
   tags            Tags[]     @relation("BlogToTags")
+  media           Media[]
+}
+
+enum MediaKind {
+  BANNER
+  INLINE
+}
+
+enum MediaStatus {
+  ACTIVE
+  ORPHANED
+}
+
+model Media {
+  id             String      @id @default(cuid())
+  url            String      @unique
+  imageKitFileId String?
+  ownerId        String
+  blogId         String?
+  kind           MediaKind
+  alt            String?
+  caption        String?
+  credit         String?
+  status         MediaStatus @default(ACTIVE)
+  createdAt      DateTime    @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime    @updatedAt
+  owner          User        @relation(fields: [ownerId], references: [id])
+  blog           Blog?       @relation(fields: [blogId], references: [id], onDelete: SetNull)
+
+  @@index([ownerId])
+  @@index([blogId, status])
 }
 
 model Address {
@@ -638,6 +689,7 @@ model Vacancy {
   isActive         Boolean              @default(true)
   isDraft          Boolean              @default(false)
   questions        Json                 @default("[]")
+  googleFormLink   String?
   createdAt        DateTime             @default(now()) @db.Timestamptz(6)
   updatedAt        DateTime             @updatedAt
   deletedAt        DateTime?
@@ -665,5 +717,4 @@ model VacancyApplication {
   @@index([vacancyId])
   @@map("nch_vacancy_applications")
 }
-
 
